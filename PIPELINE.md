@@ -1,125 +1,433 @@
-# CI/CD pipeline for the Laravel application
+# CI/CD-пайплайн для приложения Laravel
 
-## 1. Purpose
+## 1. Назначение
 
-The repository uses GitHub Actions to validate a Laravel application and simulate deployments. The workflow file is `.github/workflows/ci.yml`.
+В репозитории используется GitHub Actions для проверки приложения Laravel и симуляции его развёртывания. Конфигурация пайплайна находится в файле:
 
-The long-lived branches are:
+```text
+.github/workflows/ci.yml
+```
 
-- `develop` — development environment;
-- `uat` — user acceptance testing environment;
-- `main` or `master` — production environment.
+В проекте используются следующие долгоживущие ветки:
 
-The workflow runs on every push. Pull requests are validated when their target branch is `develop`, `uat`, `main`, or `master`.
+* `develop` — среда разработки;
+* `uat` — среда пользовательского приёмочного тестирования;
+* `main` или `master` — production-среда.
 
-## 2. Environment files
+Пайплайн запускается при каждом обновлении репозитория через `push`.
 
-The repository contains non-secret templates:
+Проверка pull request выполняется, если его целевой веткой является:
 
-| File | Purpose |
-|---|---|
-| `.env.dev` | Development deployment simulation |
-| `.env.uat` | UAT deployment simulation |
-| `.env.prod` | Production deployment simulation |
-| `.env.ci` | CI tests with SQLite `:memory:` and debug disabled |
+* `develop`;
+* `uat`;
+* `main`;
+* `master`.
 
-The real `.env` is ignored by Git and must never be committed. `APP_KEY` is intentionally blank in the committed templates. In CI, the key is generated temporarily. Real database passwords and application keys must be stored as environment secrets, not committed.
+## 2. Файлы конфигурации окружения
 
-## 3. Pipeline jobs and gates
+Репозиторий содержит шаблоны конфигурации для разных окружений:
 
-### Tests
+| Файл        | Назначение                                                                             |
+| ----------- | -------------------------------------------------------------------------------------- |
+| `.env.dev`  | Симуляция развёртывания в среду разработки                                             |
+| `.env.uat`  | Симуляция развёртывания в UAT-среду                                                    |
+| `.env.prod` | Симуляция развёртывания в production-среду                                             |
+| `.env.ci`   | Конфигурация для запуска тестов в CI с SQLite `:memory:` и отключённым режимом отладки |
 
-The test job installs dependencies, copies `.env.ci` to `.env`, generates a temporary key, and runs:
+Основной файл `.env` добавлен в `.gitignore` и не должен попадать в репозиторий.
+
+Переменная `APP_KEY` в сохранённых шаблонах намеренно оставлена пустой. Во время выполнения CI/CD-пайплайна временный ключ приложения генерируется автоматически.
+
+Настоящие пароли от баз данных, ключи приложения, токены и другие конфиденциальные значения должны храниться в GitHub Secrets, а не в исходном коде или `.env`-шаблонах.
+
+## 3. Этапы пайплайна и условия прохождения
+
+### 3.1. Тестирование
+
+Задание тестирования выполняет следующие действия:
+
+1. устанавливает Composer-зависимости;
+2. копирует `.env.ci` в `.env`;
+3. генерирует временный ключ приложения;
+4. запускает тесты Laravel с измерением покрытия кода.
+
+Команда запуска тестов:
 
 ```bash
 php artisan test --coverage --min=50
 ```
 
-The job fails when a test fails or total application coverage is lower than 50%. PCOV is enabled in the runner.
+Пайплайн завершается с ошибкой в следующих случаях:
 
-### Static analysis
+* хотя бы один тест завершился ошибкой;
+* общее покрытие кода приложения составляет менее 50%.
 
-Larastan and PHPStan strict rules analyze `app` and `routes` at level 6:
+Для сбора покрытия кода на GitHub Actions runner используется расширение PCOV.
+
+### 3.2. Статический анализ
+
+Для статического анализа кода используются Larastan и PHPStan со строгими правилами.
+
+Анализируются каталоги:
+
+```text
+app
+routes
+```
+
+Уровень анализа PHPStan:
+
+```text
+6
+```
+
+Команда запуска:
 
 ```bash
 ./vendor/bin/phpstan analyse --no-progress --memory-limit=2G
 ```
 
-No baseline is used. Every reported PHPStan error fails the job.
+Baseline не используется.
 
-### Linting and typing rules
+Любая ошибка, найденная PHPStan или Larastan, приводит к завершению задания с ошибкой.
 
-On pull requests and long-lived branches, Pint runs in check-only mode:
+### 3.3. Линтинг и проверка типизации
+
+Для проверки форматирования используется Laravel Pint.
+
+В pull request и в долгоживущих ветках Pint запускается только в режиме проверки:
 
 ```bash
 ./vendor/bin/pint --test
 ```
 
-On pushes to other branches, Pint formats the code and the workflow commits the changes back with a `[skip ci]` commit message. The custom `tools/check-native-types.php` checker fails when a named function or method has an untyped parameter or lacks a return type where PHP permits one. It also checks `<?php`, `strict_types`, camelCase variable names, forbidden short tags, and direct HTML output through `echo`/`print`.
+В этом режиме Pint не изменяет файлы. Если код не соответствует правилам форматирования, задание завершается с ошибкой.
 
-The Laravel/PSR-12 formatter requires four-space indentation and omits the closing `?>` tag in PHP-only files. Those two rules conflict with the supplied course notes requiring tabs and a closing tag. The pipeline follows the explicit laboratory requirement to use the Laravel/PSR-12 preset; all non-conflicting course rules are followed, including `<?php`, meaningful English camelCase names, strict declarations, and typed parameters/returns.
+При push в другие ветки, например feature-ветки, Pint автоматически форматирует PHP-код. После форматирования workflow создаёт коммит с сообщением:
 
-### Deployment simulation
+```text
+style: format PHP code with Pint [skip ci]
+```
 
-Deployment jobs depend on successful tests, static analysis, and linting:
+Метка `[skip ci]` предотвращает повторный запуск пайплайна после автоматического коммита.
 
-| Branch | File copied to `.env` | Output |
-|---|---|---|
-| `develop` | `.env.dev` | `Deploying to development with .env.dev` |
-| `uat` | `.env.uat` | `Deploying to uat with .env.uat` |
-| `main` / `master` | `.env.prod` | `Deploying to production with .env.prod` |
+Дополнительно используется пользовательский анализатор:
 
-No actual server deployment is performed.
+```text
+tools/check-native-types.php
+```
 
-## 4. Required manual production approval
+Он проверяет:
 
-Create a GitHub Environment named exactly `production`:
+* наличие типов у параметров функций и методов;
+* наличие возвращаемого типа, если PHP позволяет его указать;
+* использование открывающего тега `<?php`;
+* наличие `declare(strict_types=1);`;
+* использование английских названий переменных в camelCase;
+* отсутствие запрещённых коротких PHP-тегов;
+* отсутствие прямого вывода HTML-разметки через `echo` или `print`.
 
-1. Open repository **Settings → Environments**.
-2. Create or open `production`.
-3. Enable **Required reviewers**.
-4. Select at least one maintainer/reviewer and save the protection rule.
+Форматтер Laravel с пресетом PSR-12 требует:
 
-The `deploy-production` job references this environment, so it waits for reviewer approval before running. The `development` and `uat` environments may also be created, but they do not need reviewers.
+* использовать отступы из четырёх пробелов;
+* не использовать закрывающий тег `?>` в файлах, содержащих только PHP-код.
 
-## 5. Optional maintainer notification
+Эти правила частично противоречат требованиям учебного регламента, в котором указано использование табуляции и обязательного закрывающего тега.
 
-The final job can send the result to selected Telegram chats. Add these repository Actions secrets:
+В проекте выбран стандарт Laravel/PSR-12, поскольку его использование является отдельным требованием лабораторной работы.
 
-- `TELEGRAM_BOT_TOKEN` — token from BotFather;
-- `TELEGRAM_CHAT_IDS` — one chat ID or several comma-separated chat IDs.
+Все остальные правила учебного регламента соблюдаются:
 
-When the secrets are absent, the notification step logs that it was skipped and does not fail the pipeline.
+* PHP-код начинается с `<?php`;
+* используются осмысленные английские названия переменных;
+* составные названия переменных оформляются в camelCase;
+* параметры функций и методов типизированы;
+* у методов и функций указаны возвращаемые типы;
+* короткие PHP-теги не используются.
 
-## 6. Local verification
+### 3.4. Симуляция развёртывания
+
+Этап развёртывания запускается только после успешного завершения:
+
+* тестов;
+* статического анализа;
+* линтинга;
+* проверки типизации.
+
+Для каждой долгоживущей ветки используется отдельный файл окружения:
+
+| Ветка               | Копируемый файл | Сообщение в логе                         |
+| ------------------- | --------------- | ---------------------------------------- |
+| `develop`           | `.env.dev`      | `Deploying to development with .env.dev` |
+| `uat`               | `.env.uat`      | `Deploying to uat with .env.uat`         |
+| `main` или `master` | `.env.prod`     | `Deploying to production with .env.prod` |
+
+Перед симуляцией развёртывания соответствующий файл копируется в `.env`.
+
+Например, для ветки `uat` выполняется:
+
+```bash
+cp .env.uat .env
+```
+
+После этого в логе выводится сообщение:
+
+```text
+Deploying to uat with .env.uat
+```
+
+Фактическое развёртывание приложения на удалённый сервер не выполняется. Данный этап только имитирует процесс deployment.
+
+## 4. Ручное подтверждение production-развёртывания
+
+Для production-развёртывания используется GitHub Environment с названием:
+
+```text
+production
+```
+
+Для его настройки необходимо:
+
+1. открыть репозиторий на GitHub;
+2. перейти в **Settings → Environments**;
+3. создать или открыть окружение `production`;
+4. включить правило **Required reviewers**;
+5. выбрать пользователя, который будет подтверждать production-развёртывание;
+6. сохранить настройки.
+
+Задание:
+
+```text
+deploy-production
+```
+
+ссылается на окружение `production`.
+
+Поэтому после успешного прохождения тестов, Larastan и Pint выполнение production deployment приостанавливается со статусом:
+
+```text
+Waiting for review
+```
+
+Для продолжения необходимо нажать:
+
+```text
+Review deployments
+→ production
+→ Approve and deploy
+```
+
+После подтверждения запускается симуляция production-развёртывания.
+
+Для окружений `development` и `uat` ручное подтверждение не требуется.
+
+## 5. Необязательное уведомление сопровождающих проекта
+
+В проекте реализована дополнительная возможность отправки результата пайплайна в Telegram.
+
+Для работы уведомлений необходимо добавить в GitHub Actions два секрета:
+
+* `TELEGRAM_BOT_TOKEN` — токен Telegram-бота, созданного через BotFather;
+* `TELEGRAM_CHAT_IDS` — идентификатор одного Telegram-чата или несколько идентификаторов, разделённых запятыми.
+
+Пример значения для одного чата:
+
+```text
+123456789
+```
+
+Пример значения для нескольких чатов:
+
+```text
+123456789,987654321
+```
+
+Секреты добавляются в разделе:
+
+```text
+Settings
+→ Secrets and variables
+→ Actions
+→ Repository secrets
+```
+
+Итоговое задание уведомления запускается независимо от результата предыдущих jobs.
+
+Если тесты, статический анализ, линтинг или deployment завершились с ошибкой, в Telegram отправляется сообщение о неуспешном выполнении пайплайна.
+
+Если все обязательные этапы завершились успешно, отправляется сообщение об успешном выполнении.
+
+Если Telegram-секреты отсутствуют, шаг уведомления выводит сообщение о пропуске отправки и не завершает пайплайн с ошибкой.
+
+## 6. Локальная проверка проекта
+
+Для локальной установки зависимостей необходимо выполнить:
 
 ```bash
 composer install
+```
+
+Для полной локальной проверки используется скрипт:
+
+```bash
 bash scripts/verify-local.sh
 ```
 
-Local coverage requires PCOV or Xdebug.
+Скрипт выполняет:
 
-## 7. Creating the repository and branches
+* Laravel-тесты;
+* проверку покрытия;
+* Laravel Pint;
+* проверку типизации;
+* статический анализ Larastan.
+
+Для измерения покрытия кода локально требуется установленное расширение:
+
+* PCOV;
+* или Xdebug.
+
+При использовании Xdebug команда может запускаться так:
+
+```bash
+XDEBUG_MODE=coverage php artisan test --coverage --min=50
+```
+
+## 7. Создание репозитория и веток
+
+Для инициализации Git-репозитория используются команды:
 
 ```bash
 git init
 git add .
 git commit -m "feat: add Laravel application and CI/CD pipeline"
 git branch -M main
-git remote add origin <REPOSITORY_SSH_OR_HTTPS_URL>
+git remote add origin <ССЫЛКА_НА_РЕПОЗИТОРИЙ>
 git push -u origin main
+```
+
+После отправки ветки `main` создаются ветки `develop` и `uat`.
+
+Автоматический способ:
+
+```bash
 bash scripts/create-branches.sh main
 ```
 
-For a repository whose production branch is `master`, pass `master` to the script.
+Ручной способ:
 
-## 8. Required screenshots
+```bash
+git switch main
 
-See `SCREENSHOTS.md`. Keep the successful and intentionally failed runs in the GitHub Actions history until the work has been graded.
+git switch -c develop
+git push -u origin develop
 
-## 9. References
+git switch main
 
-- Laravel testing documentation: coverage uses `--coverage`, and `--min` makes the suite fail below the threshold.
-- Larastan documentation: install `larastan/larastan` and include its extension in `phpstan.neon`.
-- GitHub Environments documentation: a job that references a protected environment waits for a required reviewer.
+git switch -c uat
+git push -u origin uat
+
+git switch main
+```
+
+Если production-ветка называется `master`, необходимо передать скрипту аргумент:
+
+```bash
+bash scripts/create-branches.sh master
+```
+
+В результате в репозитории должны существовать три долгоживущие ветки:
+
+```text
+develop
+uat
+main
+```
+
+или:
+
+```text
+develop
+uat
+master
+```
+
+## 8. Обязательные скриншоты
+
+Для сдачи лабораторной работы необходимо подготовить три скриншота.
+
+### 8.1. Успешный пайплайн
+
+На скриншоте должны быть видны успешно завершённые задания:
+
+* Tests and coverage ≥ 50%;
+* Static analysis;
+* Lint and type-style rules;
+* Simulate deployment.
+
+### 8.2. Ошибка тестирования
+
+Необходимо временно изменить один из тестов таким образом, чтобы он завершился ошибкой.
+
+На скриншоте должны быть видны:
+
+* красный статус задания тестирования;
+* название упавшего теста;
+* текст ошибки assertion.
+
+После создания скриншота ошибочное изменение необходимо отменить.
+
+### 8.3. Ошибка линтера
+
+Необходимо временно нарушить форматирование PHP-кода.
+
+На скриншоте должны быть видны:
+
+* красный статус задания линтера;
+* название файла с нарушением;
+* сообщение Laravel Pint.
+
+После создания скриншота форматирование необходимо исправить.
+
+Успешный и намеренно неуспешные запуски следует сохранить в истории GitHub Actions до проверки лабораторной работы преподавателем.
+
+## 9. Результат работы
+
+В результате выполнения лабораторной работы был создан CI/CD-пайплайн, который:
+
+* запускается при push и pull request;
+* работает с ветками `develop`, `uat`, `main` и `master`;
+* выполняет тесты Laravel;
+* проверяет покрытие кода не менее 50%;
+* выполняет статический анализ Larastan;
+* проверяет форматирование Laravel Pint;
+* контролирует типизацию функций и методов;
+* использует отдельные конфигурации для разных окружений;
+* выполняет симуляцию развёртывания;
+* требует ручного подтверждения production-развёртывания;
+* при наличии секретов отправляет результат пайплайна в Telegram.
+
+## 10. Использованные инструменты
+
+В лабораторной работе использованы:
+
+* Laravel 12;
+* PHP 8.2 или новее;
+* Git;
+* GitHub;
+* GitHub Actions;
+* PHPUnit;
+* PCOV;
+* PHPStan;
+* Larastan;
+* Laravel Pint;
+* SQLite;
+* Telegram Bot API.
+
+## 11. Справочные материалы
+
+* документация Laravel по тестированию и покрытию кода;
+* документация Larastan по настройке статического анализа;
+* документация Laravel Pint;
+* документация GitHub Actions;
+* документация GitHub Environments;
+* документация Telegram Bot API.
