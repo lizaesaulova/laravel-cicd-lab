@@ -10,7 +10,7 @@ final class DiscountCalculator
 {
     public function calculate(float $price, int $discountPercent): float
     {
-        if($price < 0.0){
+        if ($price < 0.0) {
             throw new InvalidArgumentException('Price cannot be negative.');
         }
 
