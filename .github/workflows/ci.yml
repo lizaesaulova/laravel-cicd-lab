@@ -1,0 +1,266 @@
+name: Laravel CI/CD
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+    branches:
+      - develop
+      - uat
+      - main
+      - master
+
+permissions:
+  contents: write
+
+concurrency:
+  group: laravel-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PHP_VERSION: '8.3'
+  COMPOSER_NO_INTERACTION: '1'
+
+jobs:
+  tests:
+    name: Tests and coverage ≥ 50%
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+          extensions: mbstring, pdo_sqlite
+          coverage: pcov
+          tools: composer:v2
+
+      - name: Validate Composer configuration
+        run: composer validate --strict
+
+      - name: Install dependencies
+        run: composer install --prefer-dist --no-progress
+
+      - name: Prepare CI environment
+        run: |
+          cp .env.ci .env
+          php artisan key:generate --force
+          php artisan config:clear
+
+      - name: Run Laravel tests with coverage gate
+        run: php artisan test --coverage --min=50
+
+  static-analysis:
+    name: Static analysis (Larastan)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+          extensions: mbstring, pdo_sqlite
+          coverage: none
+          tools: composer:v2
+
+      - name: Install dependencies
+        run: composer install --prefer-dist --no-progress
+
+      - name: Prepare CI environment
+        run: |
+          cp .env.ci .env
+          php artisan key:generate --force
+          php artisan config:clear
+
+      - name: Run Larastan
+        run: ./vendor/bin/phpstan analyse --no-progress --memory-limit=2G
+
+  lint:
+    name: Lint and type-style rules
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'push' && github.ref_name || github.sha }}
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+          coverage: none
+          tools: composer:v2
+
+      - name: Install dependencies
+        run: composer install --prefer-dist --no-progress
+
+      - name: Check formatting on long-lived branches and pull requests
+        if: >-
+          github.event_name == 'pull_request' ||
+          github.ref_name == 'develop' ||
+          github.ref_name == 'uat' ||
+          github.ref_name == 'main' ||
+          github.ref_name == 'master'
+        run: ./vendor/bin/pint --test
+
+      - name: Format code on other pushed branches
+        if: >-
+          github.event_name == 'push' &&
+          github.ref_name != 'develop' &&
+          github.ref_name != 'uat' &&
+          github.ref_name != 'main' &&
+          github.ref_name != 'master'
+        run: ./vendor/bin/pint
+
+      - name: Check native parameter and return types
+        run: php tools/check-native-types.php
+
+      - name: Commit automatic formatting
+        if: >-
+          github.event_name == 'push' &&
+          github.ref_name != 'develop' &&
+          github.ref_name != 'uat' &&
+          github.ref_name != 'main' &&
+          github.ref_name != 'master'
+        run: |
+          if git diff --quiet; then
+            echo "Pint did not change any files."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app routes tests
+          git commit -m "style: format PHP code with Pint [skip ci]"
+          git push
+
+  deploy-development:
+    name: Simulate deployment to development
+    if: github.event_name == 'push' && github.ref_name == 'develop'
+    needs:
+      - tests
+      - static-analysis
+      - lint
+    runs-on: ubuntu-latest
+    environment: development
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Use development configuration
+        run: |
+          cp .env.dev .env
+          echo "Deploying to development with .env.dev"
+
+  deploy-uat:
+    name: Simulate deployment to UAT
+    if: github.event_name == 'push' && github.ref_name == 'uat'
+    needs:
+      - tests
+      - static-analysis
+      - lint
+    runs-on: ubuntu-latest
+    environment: uat
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Use UAT configuration
+        run: |
+          cp .env.uat .env
+          echo "Deploying to uat with .env.uat"
+
+  deploy-production:
+    name: Simulate deployment to production
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref_name == 'main' || github.ref_name == 'master')
+    needs:
+      - tests
+      - static-analysis
+      - lint
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Use production configuration
+        run: |
+          cp .env.prod .env
+          echo "Deploying to production with .env.prod"
+
+  notify-maintainers:
+    name: Notify maintainers (optional Telegram bonus)
+    if: always()
+    needs:
+      - tests
+      - static-analysis
+      - lint
+      - deploy-development
+      - deploy-uat
+      - deploy-production
+    runs-on: ubuntu-latest
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_IDS: ${{ secrets.TELEGRAM_CHAT_IDS }}
+      TESTS_RESULT: ${{ needs.tests.result }}
+      STATIC_RESULT: ${{ needs.static-analysis.result }}
+      LINT_RESULT: ${{ needs.lint.result }}
+      DEV_DEPLOY_RESULT: ${{ needs.deploy-development.result }}
+      UAT_DEPLOY_RESULT: ${{ needs.deploy-uat.result }}
+      PROD_DEPLOY_RESULT: ${{ needs.deploy-production.result }}
+
+    steps:
+      - name: Build and send pipeline result
+        shell: bash
+        run: |
+          result="success"
+
+          for jobResult in \
+            "$TESTS_RESULT" \
+            "$STATIC_RESULT" \
+            "$LINT_RESULT" \
+            "$DEV_DEPLOY_RESULT" \
+            "$UAT_DEPLOY_RESULT" \
+            "$PROD_DEPLOY_RESULT"; do
+            if [[ "$jobResult" == "failure" || "$jobResult" == "cancelled" ]]; then
+              result="failure"
+            fi
+          done
+
+          message="Laravel pipeline: ${result}
+          Repository: ${{ github.repository }}
+          Branch: ${{ github.ref_name }}
+          Actor: ${{ github.actor }}
+          Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          echo "$message"
+
+          if [[ -z "$TELEGRAM_BOT_TOKEN" || -z "$TELEGRAM_CHAT_IDS" ]]; then
+            echo "Telegram secrets are not configured; notification is skipped."
+            exit 0
+          fi
+
+          IFS=',' read -ra chatIds <<< "$TELEGRAM_CHAT_IDS"
+
+          for chatId in "${chatIds[@]}"; do
+            trimmedChatId="$(echo "$chatId" | xargs)"
+
+            curl --fail --silent --show-error \
+              --request POST \
+              "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${trimmedChatId}" \
+              --data-urlencode "text=${message}"
+          done
